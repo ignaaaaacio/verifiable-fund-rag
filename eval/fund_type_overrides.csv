@@ -3,3 +3,7 @@ S000009707,bond,PIMCO Total Return is a bond fund; the name has no bond keyword 
 S000009618,international,EUPAC is the EuroPacific Growth Fund; the legal name does not say international
 S000009613,international,New Perspective is American Funds' global stock fund; the legal name does not say global
 S000008814,target_date_balanced,Income Fund of America is an allocation fund; Income would otherwise mark it a bond
+S000009001,international,global stock fund
+S000010467,active_equity,large-cap stock fund
+S000006756,target_date_balanced,"allocation fund, holds stocks and bonds"
+S000006037,active_equity,Fidelity Contrafund is an active stock fund; the one-word name matches no type keyword

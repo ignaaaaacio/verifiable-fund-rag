@@ -294,12 +294,18 @@ def test_fund_type_order():
     assert select_funds.fund_type("JPMorgan Equity Income Fund") == "active_equity"
     assert select_funds.fund_type("Columbia Dividend Income Fund") == "active_equity"
     assert select_funds.fund_type("T. Rowe Price Overseas Stock Fund") == "international"
-    assert select_funds.fund_type("Growth & Income Fund") == "target_date_balanced"
+    assert select_funds.fund_type("Growth & Income Fund") == "active_equity"
+    assert select_funds.fund_type("JPMorgan Investor Growth & Income Fund") == "target_date_balanced"
+    assert select_funds.fund_type("JPMorgan Investor Balanced Fund") == "target_date_balanced"
+    assert select_funds.fund_type("JPMorgan Investor Conservative Fund") == "target_date_balanced"
     assert select_funds.fund_type("U.S. Government Securities Fund") == "bond"
     assert select_funds.fund_type("PGIM High Yield Fund") == "bond"
     assert select_funds.fund_type("American Funds Mortgage Fund") == "bond"
     assert select_funds.fund_type("Global Gold Fund") == "sector"
     assert select_funds.fund_type("Long/Short Equity Fund") == "alternative"
+    assert select_funds.fund_type("Calamos Market Neutral Income") == "alternative"
+    assert select_funds.fund_type("Calamos Market Neutral Income Fund") == "alternative"
+    assert select_funds.fund_type("PIMCO International Bond Fund (U.S. Dollar-Hedged)") == "bond"
 
 
 def test_family_alias_and_cap(tmp_path):
@@ -430,3 +436,86 @@ def test_loaded_class_filter(tmp_path):
     assert {share.class_id: share.class_type for share in series.classes}["C_ADM"] == "investor"
     loaded = [share.class_id for share in result["loaded"]["S1"]]
     assert loaded == ["C_529A", "C_A", "C_C", "C_F2", "C_F3", "C_R6"]
+
+
+def test_restricted_funds_drop_before_ranking(tmp_path):
+    restricted = tmp_path / "restricted.csv"
+    restricted.write_text(
+        "pattern,reason\nStrategic Advisers,Fidelity managed-account clients only\n",
+        encoding="utf-8",
+    )
+    rows = (
+        _class_row("S_R", "Strategic Advisers Growth Fund", "C1", "Investor Class", "SAAX", "1", "Fidelity")
+        + _class_row("S_P", "Fidelity Contrafund", "C2", "Investor Class", "FCNTX", "2", "Fidelity")
+    )
+    candidates = tmp_path / "candidates.csv"
+    rr = tmp_path / "rr.zip"
+    nport = tmp_path / "nport.zip"
+    write_candidates(candidates, rows)
+    write_rr(rr, "")
+    write_nport(
+        nport,
+        "A1\tS_R\t900\nA2\tS_P\t800\n",
+        "A1\t2026-06-30\t2026-08-01\nA2\t2026-06-30\t2026-08-01\n",
+    )
+    result = select_funds.build_selection(
+        candidates,
+        rr,
+        nport,
+        quotas=(("active_equity", 1),),
+        asset_floor=0,
+        families_path=None,
+        type_overrides_path=None,
+        class_overrides_path=None,
+        restricted_path=restricted,
+    )
+    assert [series.series_id for series in result["selected"]] == ["S_P"]
+    assert [series.series_id for series in result["dropped"]["restricted"]] == ["S_R"]
+    assert [series.series_id for series in result["removed"]] == ["S_R"]
+    assert [series.series_id for series in result["added"]] == ["S_P"]
+    text = select_funds.render_report(result)
+    assert "Dropped, not available to retail investors: 1" in text
+    assert "Strategic Advisers Growth Fund" in text
+    assert "Fidelity Contrafund" in text
+
+
+def test_dodge_retail_class_override_is_the_main_class(tmp_path):
+    overrides = tmp_path / "class_types.csv"
+    overrides.write_text(
+        "class_id,class_type,reason\n"
+        "DODGX,investor,Dodge & Cox's retail no-load class is named Class I\n"
+        "DODIX,investor,Dodge & Cox's retail no-load class is named Class I\n",
+        encoding="utf-8",
+    )
+    rows = (
+        _class_row("S_STK", "Dodge & Cox Stock Fund", "C_I", "Class I", "DODGX", "1", "Dodge & Cox")
+        + _class_row("S_STK", "Dodge & Cox Stock Fund", "C_X", "Class X", "DOXGX", "1", "Dodge & Cox")
+        + _class_row("S_INC", "Dodge & Cox Income Fund", "C_II", "Class I", "DODIX", "1", "Dodge & Cox")
+        + _class_row("S_INC", "Dodge & Cox Income Fund", "C_IX", "Class X", "DOXIX", "1", "Dodge & Cox")
+    )
+    candidates = tmp_path / "candidates.csv"
+    rr = tmp_path / "rr.zip"
+    nport = tmp_path / "nport.zip"
+    write_candidates(candidates, rows)
+    write_rr(rr, "")
+    write_nport(
+        nport,
+        "A1\tS_STK\t3000\nA2\tS_INC\t2000\n",
+        "A1\t2026-06-30\t2026-08-01\nA2\t2026-06-30\t2026-08-01\n",
+    )
+    result = select_funds.build_selection(
+        candidates,
+        rr,
+        nport,
+        quotas=(("active_equity", 5), ("bond", 5)),
+        asset_floor=0,
+        families_path=None,
+        type_overrides_path=None,
+        class_overrides_path=overrides,
+        restricted_path=None,
+    )
+    by_id = {series.series_id: series for series in result["selected"]}
+    assert by_id["S_STK"].main.ticker == "DODGX"
+    assert by_id["S_STK"].main.class_type == "investor"
+    assert by_id["S_INC"].main.ticker == "DODIX"
+    assert by_id["S_INC"].main.class_type == "investor"

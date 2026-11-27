@@ -413,9 +413,11 @@ def render_report(result: dict, source: str) -> str:
         "## Sales-charge and breakpoint tags",
         "",
         "These are the standard numeric tags whose names look like a sales charge or an "
-        "expense breakpoint. Breakpoint amounts are the investment levels (for example "
-        "$100,000 or $400,000) at which a fee changes; they are not the fund's minimum "
-        "initial investment.",
+        "expense breakpoint. `ExpenseBreakpointMinimumInvestmentRequiredAmount` is the "
+        "investment level where a sales-charge discount starts. It is not the discounted "
+        "rate, and it is not the fund's minimum initial investment. The maximum sales charge "
+        "is a separate tag. A cited cost can use that maximum, note that the amount qualifies "
+        "for a discount, and compute the cost before the discount.",
         "",
         "| Tag | Rows | Example values | Example otherdims |",
         "| --- | --- | --- | --- |",

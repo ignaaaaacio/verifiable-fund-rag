@@ -42,10 +42,10 @@ EXCLUDED_TYPES = {"alternative"}
 QUOTAS: tuple[tuple[str, int], ...] = (
     ("target_date_balanced", 15),
     ("sector", 5),
+    ("alternative", 0),
     ("bond", 20),
     ("index_equity", 20),
     ("international", 15),
-    ("alternative", 0),
     ("active_equity", 25),
 )
 
@@ -56,6 +56,8 @@ LOAD_TAGS = {
     "MaximumCumulativeSalesChargeOverOfferingPrice",
 }
 FEE_WAIVER_TAG = "FeeWaiverOrReimbursementOverAssets"
+FRONT_END_TAG = "MaximumSalesChargeImposedOnPurchasesOverOfferingPrice"
+BREAKPOINT_TAG = "ExpenseBreakpointMinimumInvestmentRequiredAmount"
 MINIMUM_TAG = re.compile(
     r"minimum.*initial.*invest|initial.*investment.*minimum|minimuminitialinvestment",
     re.I,
@@ -75,7 +77,8 @@ FUND_TYPE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
         "target_date_balanced",
         re.compile(
             r"\btarget\b|retirement\s+20|lifecycle|\bbalanced\b|\ballocation\b|income\s+builder|"
-            r"smart\s*retirement|conservative\s+growth|growth\s+(?:&|and)\s+income|"
+            r"smart\s*retirement|conservative\s+growth|"
+            r"JPMorgan Investor (?:Balanced|Growth|Conservative)|"
             r"tactical\s+allocation|global\s+allocation",
             re.I,
         ),
@@ -85,6 +88,14 @@ FUND_TYPE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(
             r"\bhealth|\btechnolog|\benergy\b|real\s+estate|\butilities\b|\bfinancial\b|"
             r"\bscience\b|\bgold\b|precious\s+metals|life\s+sciences|\binfrastructure\b",
+            re.I,
+        ),
+    ),
+    (
+        "alternative",
+        re.compile(
+            r"\bhedge\b|(?<!dollar-)(?<!currency-)\bhedged\b|market\s+neutral|long\s*/\s*short|long[\s-]short|"
+            r"tactical\s+plus|sector\s+plus|managed\s+futures",
             re.I,
         ),
     ),
@@ -106,14 +117,6 @@ FUND_TYPE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(
             r"\binternational\b|\bglobal\b|\bworld\b|\bemerging\b|\beurope\b|\bpacific\b|\bdeveloping\b|"
             r"\boverseas\b|\bforeign\b",
-            re.I,
-        ),
-    ),
-    (
-        "alternative",
-        re.compile(
-            r"\bhedge\b|\bhedged\b|market\s+neutral|long\s*/\s*short|long[\s-]short|"
-            r"tactical\s+plus|sector\s+plus|managed\s+futures",
             re.I,
         ),
     ),
@@ -182,6 +185,7 @@ class Series:
     how: str = ""
     type_before: str = ""
     type_reason: str = ""
+    restricted_reason: str = ""
 
     @property
     def filer_key(self) -> str:
@@ -214,6 +218,19 @@ def parse_date(value: str | None) -> str:
         except ValueError:
             continue
     return token
+
+
+def format_charge(value: Decimal | None) -> str:
+    """Front-end loads are fractions of the offering price. Breakpoints are dollar amounts."""
+    if value is None:
+        return "(none)"
+    if abs(value) <= 1:
+        percent = value * Decimal(100)
+        text = format(percent, "f")
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        return f"{text}%"
+    return format_assets(value)
 
 
 def format_assets(value: Decimal | None) -> str:
@@ -339,6 +356,60 @@ def assign_family(series_name: str, filer_name: str, rules: list[tuple[re.Patter
     return filer_name or series_name, "filer"
 
 
+def load_restricted_rules(path: Path | None) -> list[tuple[re.Pattern[str], str]]:
+    """Patterns for series the public cannot buy. Columns: pattern, reason."""
+    if path is None or not path.exists():
+        return []
+    rules = []
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        columns = _column_map(reader.fieldnames)
+        pattern_col = _col(columns, "pattern")
+        reason_col = _col(columns, "reason")
+        if not pattern_col:
+            raise SystemExit(f"{path} must have a pattern column")
+        for row in reader:
+            pattern = (row.get(pattern_col) or "").strip()
+            if not pattern:
+                continue
+            reason = (row.get(reason_col) or "").strip() if reason_col else ""
+            rules.append((re.compile(pattern, re.I), reason))
+    return rules
+
+
+def restricted_reason(series_name: str, rules: list[tuple[re.Pattern[str], str]]) -> str:
+    for pattern, reason in rules:
+        if pattern.search(series_name or ""):
+            return reason or "not available to retail investors"
+    return ""
+
+
+def load_class_type_overrides(path: Path | None) -> dict[str, str]:
+    """Map a class id or ticker to a class type. Columns: class_id or ticker, class_type, reason."""
+    if path is None or not path.exists():
+        return {}
+    overrides: dict[str, str] = {}
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        columns = _column_map(reader.fieldnames)
+        ident_col = _col(columns, "classid", "class_id", "ticker")
+        type_col = _col(columns, "classtype", "class_type")
+        if not ident_col or not type_col:
+            raise SystemExit(f"{path} must have class_id or ticker, and class_type")
+        ticker_col = _col(columns, "ticker") if ident_col != _col(columns, "ticker") else None
+        for row in reader:
+            class_type_name = (row.get(type_col) or "").strip()
+            if not class_type_name:
+                continue
+            for column in (ident_col, ticker_col):
+                if not column:
+                    continue
+                ident = (row.get(column) or "").strip().upper()
+                if ident:
+                    overrides[ident] = class_type_name
+    return overrides
+
+
 def is_etf_series(series_name: str) -> bool:
     return ETF_NAME.search(series_name or "") is not None
 
@@ -362,7 +433,7 @@ def _col(columns: dict[str, str], *candidates: str) -> str | None:
     return None
 
 
-def read_candidates(path: Path) -> list[Series]:
+def read_candidates(path: Path, class_overrides: dict[str, str] | None = None) -> list[Series]:
     with path.open(newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
         columns = _column_map(reader.fieldnames)
@@ -401,6 +472,10 @@ def read_candidates(path: Path) -> list[Series]:
                 complete=_truthy(cell(row, "complete")),
                 class_type=class_type(cell(row, "classname"), cell(row, "seriesname")),
             )
+            overrides = class_overrides or {}
+            forced = overrides.get(share.class_id) or overrides.get(share.ticker.upper())
+            if forced:
+                share.class_type = forced
             series.classes.append(share)
     series_list = list(grouped.values())
     for series in series_list:
@@ -513,6 +588,10 @@ def _read_rr_zip(zip_path: Path, wanted: set[tuple[str, str]]) -> dict:
     waived: set[str] = set()
     minimums: dict[str, Decimal] = {}
     minimum_tags: set[str] = set()
+    front_end: dict[str, Decimal] = {}
+    breakpoints: dict[str, set[Decimal]] = {}
+    series_breakpoints: dict[tuple[str, str], set[Decimal]] = {}
+    wanted_adsh = {adsh for adsh, _ in wanted}
     with zipfile.ZipFile(zip_path) as zf:
         name = _member(zf, lambda item: Path(item).name.lower() == "num.tsv")
         if name is None:
@@ -533,11 +612,28 @@ def _read_rr_zip(zip_path: Path, wanted: set[tuple[str, str]]) -> dict:
                         if current is None or amount < current:
                             minimums[class_id] = amount
                 continue
+            if tag == BREAKPOINT_TAG:
+                amount = parse_number(row.get("value"))
+                if amount is None:
+                    continue
+                series_id = (row.get("series") or "").strip().upper()
+                if not series_id:
+                    found = re.search(r"LegalEntity=(S[0-9]+)", row.get("otherdims") or "", re.I)
+                    series_id = found.group(1).upper() if found else ""
+                if class_id and relevant:
+                    breakpoints.setdefault(class_id, set()).add(amount)
+                elif not class_id and adsh in wanted_adsh and series_id:
+                    series_breakpoints.setdefault((adsh, series_id), set()).add(amount)
+                continue
             if not relevant:
                 continue
             amount = parse_number(row.get("value"))
             if amount is None:
                 continue
+            if tag == FRONT_END_TAG:
+                current = front_end.get(class_id)
+                if current is None or amount > current:
+                    front_end[class_id] = amount
             if tag in LOAD_TAGS and amount > 0:
                 loaded.add(class_id)
             elif tag == FEE_WAIVER_TAG and amount != 0:
@@ -547,6 +643,9 @@ def _read_rr_zip(zip_path: Path, wanted: set[tuple[str, str]]) -> dict:
         "waived": waived,
         "minimums": minimums,
         "minimum_tags": sorted(minimum_tags),
+        "front_end": front_end,
+        "breakpoints": breakpoints,
+        "series_breakpoints": series_breakpoints,
     }
 
 
@@ -557,6 +656,9 @@ def read_rr_facts(zip_paths: Path | list[Path], wanted: set[tuple[str, str]]) ->
     waived: set[str] = set()
     minimums: dict[str, Decimal] = {}
     minimum_tags: set[str] = set()
+    front_end: dict[str, Decimal] = {}
+    breakpoints: dict[str, set[Decimal]] = {}
+    series_breakpoints: dict[tuple[str, str], set[Decimal]] = {}
     for path in paths:
         part = _read_rr_zip(path, wanted)
         loaded |= part["loaded"]
@@ -566,11 +668,22 @@ def read_rr_facts(zip_paths: Path | list[Path], wanted: set[tuple[str, str]]) ->
             current = minimums.get(class_id)
             if current is None or amount < current:
                 minimums[class_id] = amount
+        for class_id, amount in part["front_end"].items():
+            current = front_end.get(class_id)
+            if current is None or amount > current:
+                front_end[class_id] = amount
+        for class_id, amounts in part["breakpoints"].items():
+            breakpoints.setdefault(class_id, set()).update(amounts)
+        for series_id, amounts in part["series_breakpoints"].items():
+            series_breakpoints.setdefault(series_id, set()).update(amounts)
     return {
         "loaded": loaded,
         "waived": waived,
         "minimums": minimums,
         "minimum_tags": sorted(minimum_tags),
+        "front_end": front_end,
+        "breakpoints": breakpoints,
+        "series_breakpoints": series_breakpoints,
     }
 
 
@@ -823,8 +936,10 @@ def build_selection(
     asset_floor: Decimal = ASSET_FLOOR,
     families_path: Path | None = Path("eval/families.csv"),
     type_overrides_path: Path | None = Path("eval/fund_type_overrides.csv"),
+    class_overrides_path: Path | None = Path("eval/class_type_overrides.csv"),
+    restricted_path: Path | None = Path("eval/restricted_funds.csv"),
 ) -> dict:
-    series_list = read_candidates(candidates)
+    series_list = read_candidates(candidates, load_class_type_overrides(class_overrides_path))
     rules = load_family_rules(families_path)
     for series in series_list:
         series.family, series.family_source = assign_family(series.series_name, series.filer_name, rules)
@@ -841,8 +956,25 @@ def build_selection(
     eligible = filtered["eligible"]
     attach_assets(eligible, read_net_assets(nport_zip))
     eligible, too_small = apply_asset_floor(eligible, asset_floor)
-    ranked = rank_series(eligible)
+    restricted_rules = load_restricted_rules(restricted_path)
+    restricted: list[Series] = []
+    public: list[Series] = []
+    for series in eligible:
+        reason = restricted_reason(series.series_name, restricted_rules)
+        if reason:
+            series.restricted_reason = reason
+            restricted.append(series)
+        else:
+            public.append(series)
+    would = fill_quotas(
+        rank_series(eligible), quotas=quotas, family_cap=family_cap, filer_cap=filer_cap
+    )
+    would_ids = {series.series_id for series in would}
+    ranked = rank_series(public)
     selected = fill_quotas(ranked, quotas=quotas, family_cap=family_cap, filer_cap=filer_cap)
+    removed = [series for series in would if series.series_id not in {item.series_id for item in selected}]
+    added = [series for series in selected if series.series_id not in would_ids]
+    eligible = public
     override_rows: list[dict[str, str]] = []
     if overrides is not None:
         override_rows = _override_rows(overrides)
@@ -853,7 +985,7 @@ def build_selection(
     return {
         "series_in": series_list,
         "eligible": eligible,
-        "dropped": {**filtered["dropped"], "small": too_small},
+        "dropped": {**filtered["dropped"], "small": too_small, "restricted": restricted},
         "minimum_active": filtered["minimum_active"],
         "minimum_tags": facts["minimum_tags"],
         "ranked": ranked,
@@ -862,6 +994,11 @@ def build_selection(
         "quotas": quotas,
         "overrides": override_rows,
         "type_corrections": type_corrections,
+        "removed": removed,
+        "added": added,
+        "front_end": facts["front_end"],
+        "breakpoints": facts["breakpoints"],
+        "series_breakpoints": facts["series_breakpoints"],
         "asset_floor": asset_floor,
         "family_cap": family_cap if filer_cap is None else filer_cap,
         "inputs": {
@@ -872,6 +1009,8 @@ def build_selection(
             "overrides": overrides,
             "families": families_path,
             "type_overrides": type_overrides_path,
+            "class_overrides": class_overrides_path,
+            "restricted": restricted_path,
         },
     }
 
@@ -884,6 +1023,125 @@ def _quota_table(result: dict) -> list[tuple[str, int, int, int]]:
         by_left = sum(1 for series in taken if series.how == "leftover")
         rows.append((name, quota, by_quota, by_left))
     return rows
+
+
+def _retail_section(result: dict) -> list[str]:
+    restricted = result["dropped"]["restricted"]
+    removed_ids = {series.series_id for series in result["removed"]}
+    lines = ["", "## Not available to retail investors", ""]
+    if not restricted:
+        lines.append("No series that passed the other filters matched a restricted-fund pattern.")
+        lines.append("")
+        return lines
+    lines.append(
+        f"{len(restricted)} series passed the other hard filters and the size floor, "
+        "then were dropped because the public cannot buy them."
+    )
+    lines.append("")
+    lines.append("| Series | Reason | Had a slot in the 100 |")
+    lines.append("| --- | --- | --- |")
+    ordered = sorted(restricted, key=lambda series: (-(series.net_assets or Decimal(0)), series.series_name))
+    for series in ordered:
+        slot = "yes" if series.series_id in removed_ids else "no"
+        lines.append(f"| {series.series_name} | {series.restricted_reason} | {slot} |")
+    lines += ["", "### Replaced by", ""]
+    added = result["added"]
+    if not added:
+        lines.append("Dropping these series did not change which funds filled the 100.")
+    else:
+        lines.append("These funds took the slots the restricted series had held:")
+        lines.append("")
+        for series in sorted(added, key=lambda item: (-(item.net_assets or Decimal(0)), item.series_name)):
+            ticker = series.main.ticker if series.main else ""
+            detail = f"{series.family}, {series.fund_type}"
+            if ticker:
+                detail += f", {ticker}"
+            lines.append(f"- {series.series_name} ({detail})")
+    extra = [series for series in result["removed"] if not series.restricted_reason]
+    if extra:
+        lines.append("")
+        lines.append("These other series also left the 100 when the quotas and family cap were filled again:")
+        for series in extra:
+            lines.append(f"- {series.series_name} ({series.family})")
+    lines.append("")
+    return lines
+
+
+def _breakpoint_section(result: dict) -> list[str]:
+    front = result.get("front_end") or {}
+    points = result.get("breakpoints") or {}
+    series_points = result.get("series_breakpoints") or {}
+    listed = [
+        (series, share)
+        for series in result["selected"]
+        for share in result["loaded"][series.series_id]
+        if share.class_type in {"A", "529A"}
+    ]
+    lines = [
+        "",
+        "## Front-end sales charge and breakpoints",
+        "",
+        "Loaded Class A and 529-A only. The front-end figure is the maximum "
+        "`MaximumSalesChargeImposedOnPurchasesOverOfferingPrice`, which is the sales charge before "
+        "any breakpoint discount. `ExpenseBreakpointMinimumInvestmentRequiredAmount` is only the "
+        "investment level where a discount starts ($25,000, $50,000, or $100,000 here). It does "
+        "not say what the charge falls to at $100,000 or $400,000, so those amounts cannot be "
+        "priced from this tag. A cited answer can show the maximum sales charge, say the "
+        "investment qualifies for a discount, and compute the cost before that discount. Most "
+        "filings leave the class blank and put only the series id in `otherdims`, so a series-level "
+        "amount is shown on each loaded A and 529-A of that series and marked series. 0% means the "
+        "front-end tag is present and the maximum is zero. (none) means that tag was not filed "
+        "for the class or its series.",
+        "",
+    ]
+    a_shares = [share for _, share in listed if share.class_type == "A"]
+    charge_counts: Counter = Counter()
+    point_counts: Counter = Counter()
+    with_charge = 0
+    with_point = 0
+    for share in a_shares:
+        if share.class_id in front:
+            with_charge += 1
+        charge_counts[format_charge(front.get(share.class_id))] += 1
+        amounts = points.get(share.class_id) or series_points.get((share.adsh, share.series_id)) or set()
+        if amounts:
+            with_point += 1
+            for amount in amounts:
+                point_counts[format_assets(amount)] += 1
+        else:
+            point_counts["(none)"] += 1
+    lines.append(
+        f"Loaded Class A: {len(a_shares)}. {with_charge} have a front-end sales-charge tag. "
+        f"{with_point} have at least one breakpoint amount."
+    )
+    lines += ["", "| Front-end charge | Class A count |", "| --- | --- |"]
+    for label, count in sorted(charge_counts.items(), key=lambda item: (-item[1], item[0])):
+        lines.append(f"| {label} | {count} |")
+    lines += ["", "| Breakpoint amount | Class A count |", "| --- | --- |"]
+    for label, count in sorted(point_counts.items(), key=lambda item: (-item[1], item[0])):
+        lines.append(f"| {label} | {count} |")
+    lines += [
+        "",
+        "| Series | Class | Ticker | Type | Max front-end | Breakpoint amounts |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    if not listed:
+        lines.append("| (none) |  |  |  |  |  |")
+    for series, share in sorted(listed, key=lambda item: (item[0].series_name, item[1].class_id)):
+        class_amounts = points.get(share.class_id) or set()
+        series_amounts = series_points.get((share.adsh, series.series_id)) or set()
+        if class_amounts:
+            shown = ", ".join(format_assets(amount) for amount in sorted(class_amounts))
+        elif series_amounts:
+            shown = ", ".join(format_assets(amount) for amount in sorted(series_amounts)) + " (series)"
+        else:
+            shown = "(none)"
+        lines.append(
+            f"| {series.series_name} | {share.class_name} | {share.ticker} | {share.class_type} | "
+            f"{format_charge(front.get(share.class_id))} | {shown} |"
+        )
+    lines.append("")
+    return lines
 
 
 def render_report(result: dict) -> str:
@@ -919,7 +1177,13 @@ def render_report(result: dict) -> str:
             "(expense-breakpoint minimums are not that tag)."
         )
     lines.append(f"- Dropped, net assets under ${format_assets(result['asset_floor'])} or no N-PORT match: {len(dropped['small'])}")
-    lines.append(f"- Eligible after hard filters and the size floor: {len(result['eligible'])}")
+    lines.append(f"- Dropped, not available to retail investors: {len(dropped['restricted'])}")
+    still_restricted = [series for series in selected if series.restricted_reason]
+    lines.append(
+        "- No selected fund is closed to retail investors: "
+        + ("met" if not still_restricted else "not met")
+    )
+    lines.append(f"- Eligible after hard filters, the size floor, and the retail filter: {len(result['eligible'])}")
     lines.append(f"- Selected: {len(selected)}")
     below = [series for series in selected if series.net_assets is None or series.net_assets < result["asset_floor"]]
     lines.append(
@@ -1009,6 +1273,8 @@ def render_report(result: dict) -> str:
         "F-1 is its own class type and is not loaded. R-6 is the only retirement class loaded, "
         "and 529-A is the only 529 class loaded. " + f3_why
     )
+    lines.extend(_retail_section(result))
+    lines.extend(_breakpoint_section(result))
 
     lines += ["", "## Families", "", "| Family | Series |", "| --- | --- |"]
     family_rows = sorted(families.values(), key=lambda group: (-len(group), group[0].family))
@@ -1113,6 +1379,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--overrides", type=Path)
     parser.add_argument("--families", type=Path, default=Path("eval/families.csv"))
     parser.add_argument("--type-overrides", type=Path, default=Path("eval/fund_type_overrides.csv"))
+    parser.add_argument("--class-overrides", type=Path, default=Path("eval/class_type_overrides.csv"))
+    parser.add_argument("--restricted", type=Path, default=Path("eval/restricted_funds.csv"))
     parser.add_argument("--asset-floor", type=Decimal, default=ASSET_FLOOR)
     parser.add_argument("--universe", type=Path, default=Path("eval/fund_universe.csv"))
     parser.add_argument("--classes", type=Path, default=Path("eval/share_classes.csv"))
@@ -1128,6 +1396,8 @@ def main(argv: list[str] | None = None) -> int:
         args.overrides,
         families_path=args.families,
         type_overrides_path=args.type_overrides,
+        class_overrides_path=args.class_overrides,
+        restricted_path=args.restricted,
         asset_floor=args.asset_floor,
     )
     write_outputs(result, args.universe, args.classes, args.report)
