@@ -7,3 +7,6 @@ data/
 reports/
 node_modules/
 dist/
+.DS_Store
+# Extracted SEC Risk/Return sets are too large for GitHub.
+*_rr1/
