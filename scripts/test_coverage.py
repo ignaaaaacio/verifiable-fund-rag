@@ -120,3 +120,63 @@ def test_main_writes_candidates_header(tmp_path):
     assert len(rows) == 3
     complete = {row["classid"]: row["complete"] for row in rows}
     assert complete == {"C000000001": "1", "C000000002": "0", "C000000003": "1"}
+    assert rows[0]["source_zip"] == "rr.zip"
+
+
+def test_multi_zip_keeps_latest_filing(tmp_path):
+    older = tmp_path / "2025q4_rr1.zip"
+    newer = tmp_path / "2026q1_rr1.zip"
+    old_sub = (
+        "adsh\tcik\tname\tfiled\taccepted\n"
+        "OLD-26-000001\t0000000001\tAlpha Funds\t20260101\t2026-01-01 00:00:00.0\n"
+    )
+    new_sub = (
+        "adsh\tcik\tname\tfiled\taccepted\n"
+        "NEW-26-000009\t0000000001\tAlpha Funds\t20260601\t2026-06-01 00:00:00.0\n"
+    )
+    old_scn = (
+        "adsh\tseriesid\tseriesname\tclassid\tclassname\tticker\n"
+        "OLD-26-000001\tS000000001\tAlpha Growth Fund\tC000000001\tClass A\tOLDXX\n"
+        "OLD-26-000001\tS000000002\tOnly In Older Zip\tC000000009\tClass A\tONLYX\n"
+    )
+    new_scn = (
+        "adsh\tseriesid\tseriesname\tclassid\tclassname\tticker\n"
+        "NEW-26-000009\tS000000001\tAlpha Growth Fund\tC000000001\tClass A\tNEWXX\n"
+    )
+
+    def facts(adsh: str, series: str, class_id: str) -> str:
+        body = f"{adsh}\tExpensesOverAssets\toef/2026\t0\t{series}\t{class_id}\t\t0.01\n"
+        body += _examples(adsh, series, class_id, ("01", "03", "05", "10"))
+        body += _return_rows(adsh, series, class_id)
+        return body
+
+    old_num = NUM_HEADER + facts("OLD-26-000001", "S000000001", "C000000001")
+    old_num += facts("OLD-26-000001", "S000000002", "C000000009")
+    new_num = NUM_HEADER + facts("NEW-26-000009", "S000000001", "C000000001")
+    old_txt = (
+        "adsh\ttag\tversion\tseries\tclass\tvalue\n"
+        "OLD-26-000001\tRiskTextBlock\toef/2026\tS000000001\tC000000001\tOld risk\n"
+        "OLD-26-000001\tRiskTextBlock\toef/2026\tS000000002\tC000000009\tOnly risk\n"
+    )
+    new_txt = (
+        "adsh\ttag\tversion\tseries\tclass\tvalue\n"
+        "NEW-26-000009\tRiskTextBlock\toef/2026\tS000000001\tC000000001\tNew risk\n"
+    )
+    for path, sub, scn, num, txt in (
+        (newer, new_sub, new_scn, new_num, new_txt),
+        (older, old_sub, old_scn, old_num, old_txt),
+    ):
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr("sub.tsv", sub)
+            zf.writestr("scn.tsv", scn)
+            zf.writestr("num.tsv", num)
+            zf.writestr("txt.tsv", txt)
+
+    result = coverage.analyze([newer, older])
+    by_class = {rec["classid"]: rec for rec in result["records"]}
+    assert set(by_class) == {"C000000001", "C000000009"}
+    assert by_class["C000000001"]["adsh"] == "NEW-26-000009"
+    assert by_class["C000000001"]["ticker"] == "NEWXX"
+    assert by_class["C000000001"]["source_zip"] == "2026q1_rr1.zip"
+    assert by_class["C000000009"]["adsh"] == "OLD-26-000001"
+    assert by_class["C000000009"]["source_zip"] == "2025q4_rr1.zip"

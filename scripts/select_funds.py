@@ -1,16 +1,17 @@
-"""Pick the 100-fund universe from coverage candidates, the Risk/Return zip, and N-PORT.
+"""Pick the 100-fund universe from coverage candidates, the Risk/Return zips, and N-PORT.
 
 Usage:
     python3 scripts/select_funds.py \\
         --candidates reports/candidates.csv \\
-        --rr-zip <rr zip> \\
+        --rr-zip <rr zip> [--rr-zip <rr zip> ...] \\
         --nport-zip <nport zip> \\
         [--overrides eval/overrides.csv]
 
-A series is kept only when it is not an ETF, has risk text, and has a complete
-Class A or a complete no-load Investor class. Series are ranked by N-PORT net
-assets and filled into type quotas, with at most 10 series per filer. Expert
-overrides are applied after that rule.
+A series is kept only when it is not an ETF, has risk text, has a complete
+Class A or a complete no-load Investor class (Admiral counts as Investor),
+and has N-PORT net assets of at least $1 billion. Series are ranked by net
+assets and filled into type quotas, with at most 8 series per fund family.
+Alternatives are excluded. Expert overrides are applied after that rule.
 
 Standard library only. Holdings tables inside the N-PORT zip are not read.
 """
@@ -32,17 +33,20 @@ from pathlib import Path
 csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
 
 STANDARD_PREFIXES = ("oef", "rr", "dei", "fnd", "us-gaap", "srt")
-FILER_CAP = 10
+FAMILY_CAP = 8
 MAX_OVERRIDE_ADDS = 15
 MINIMUM_INVESTMENT_CAP = Decimal("100000")
+ASSET_FLOOR = Decimal("1000000000")
+EXCLUDED_TYPES = {"alternative"}
 
 QUOTAS: tuple[tuple[str, int], ...] = (
     ("target_date_balanced", 15),
-    ("bond", 20),
-    ("international", 15),
-    ("index_equity", 20),
-    ("active_equity", 25),
     ("sector", 5),
+    ("bond", 20),
+    ("index_equity", 20),
+    ("international", 15),
+    ("alternative", 0),
+    ("active_equity", 25),
 )
 
 LOAD_TAGS = {
@@ -58,27 +62,38 @@ MINIMUM_TAG = re.compile(
 )
 ETF_NAME = re.compile(r"\betf\b|exchange[\s-]?traded", re.I)
 
-LOADED_TYPES = {"A", "investor", "F2", "F3", "C", "retirement", "529"}
+# Extra classes loaded besides the single main class. F-1 is reported and not loaded.
+# R-1 through R-5 and 529 classes other than 529-A are not loaded.
+LOAD_EXTRA = {"F2", "F3", "C", "R6", "529A"}
 
+NOT_BOND = re.compile(
+    r"equity\s+income|dividend\s+income|growth\s+(?:&|and)\s+income",
+    re.I,
+)
 FUND_TYPE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "target_date_balanced",
         re.compile(
-            r"\btarget\b|retirement\s+20|lifecycle|\bbalanced\b|\ballocation\b|income\s+builder",
+            r"\btarget\b|retirement\s+20|lifecycle|\bbalanced\b|\ballocation\b|income\s+builder|"
+            r"smart\s*retirement|conservative\s+growth|growth\s+(?:&|and)\s+income|"
+            r"tactical\s+allocation|global\s+allocation",
+            re.I,
+        ),
+    ),
+    (
+        "sector",
+        re.compile(
+            r"\bhealth|\btechnolog|\benergy\b|real\s+estate|\butilities\b|\bfinancial\b|"
+            r"\bscience\b|\bgold\b|precious\s+metals|life\s+sciences|\binfrastructure\b",
             re.I,
         ),
     ),
     (
         "bond",
         re.compile(
-            r"\bbond\b|\bincome\b|\bfixed\b|\btreasury\b|\bmunicipal\b|tax[-\s]?exempt|\bcredit\b|\bduration\b",
-            re.I,
-        ),
-    ),
-    (
-        "international",
-        re.compile(
-            r"\binternational\b|\bglobal\b|\bworld\b|\bemerging\b|\beurope\b|\bpacific\b|\bdeveloping\b",
+            r"\bbond\b|\bincome\b|\bfixed\b|\btreasury\b|\bmunicipal\b|tax[-\s]?exempt|tax[-\s]?free|"
+            r"\bcredit\b|\bduration\b|\bgovernment\b|securities\s+fund|\bmortgage\b|high\s+yield|"
+            r"short[-\s]?term|limited\s+term|\bcorporate\b|\bultra\b",
             re.I,
         ),
     ),
@@ -87,9 +102,18 @@ FUND_TYPE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(r"\bindex\b|\b500\b|total\s+stock|total\s+market", re.I),
     ),
     (
-        "sector",
+        "international",
         re.compile(
-            r"\bhealth\b|\btechnolog|\benergy\b|real\s+estate|\butilities\b|\bfinancial\b|\bscience\b",
+            r"\binternational\b|\bglobal\b|\bworld\b|\bemerging\b|\beurope\b|\bpacific\b|\bdeveloping\b|"
+            r"\boverseas\b|\bforeign\b",
+            re.I,
+        ),
+    ),
+    (
+        "alternative",
+        re.compile(
+            r"\bhedge\b|\bhedged\b|market\s+neutral|long\s*/\s*short|long[\s-]short|"
+            r"tactical\s+plus|sector\s+plus|managed\s+futures",
             re.I,
         ),
     ),
@@ -99,12 +123,19 @@ FUND_TYPE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
 )
 
+MULTI_SPONSOR = re.compile(
+    r"mutual fund series trust|northern lights|manager directed portfolios",
+    re.I,
+)
+SPONSOR_SECOND_WORD = {"river", "capital", "point", "bridge", "harbor", "street"}
+
 UNIVERSE_FIELDS = [
     "rank",
     "series_id",
     "series_name",
     "filer_name",
     "cik",
+    "family",
     "fund_type",
     "main_class_id",
     "main_class_type",
@@ -143,10 +174,14 @@ class Series:
     main: ShareClass | None = None
     net_assets: Decimal | None = None
     report_date: str = ""
+    family: str = ""
+    family_source: str = ""
     fee_waiver: bool = False
     selected_by: str = "rule"
     reason: str = ""
     how: str = ""
+    type_before: str = ""
+    type_reason: str = ""
 
     @property
     def filer_key(self) -> str:
@@ -196,32 +231,41 @@ def normalize_class_name(name: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def class_type(name: str) -> str:
+def class_type(name: str, series_name: str = "") -> str:
     """Map a share-class name onto the universe's class types.
 
     529 is tested first so Class 529-A and Class 529-F-2 stay 529. Investor A
-    and Investor C are load classes, not the no-load Investor class.
+    and Investor C are load classes, not the no-load Investor class. A class
+    whose name is the series name is the unlabeled no-load retail class.
     """
     text = normalize_class_name(name)
     if not text:
         return "other"
     if re.search(r"\b529\b", text):
+        if re.search(r"\b529\s+a\b", text):
+            return "529A"
         return "529"
     if ETF_NAME.search(text):
         return "etf"
+    if re.search(r"\bf\s*1\b", text):
+        return "F1"
     if re.search(r"\bf\s*2\b", text):
         return "F2"
     if re.search(r"\bf\s*3\b", text):
         return "F3"
+    if re.search(r"\badmiral\b", text):
+        return "investor"
     if re.search(r"\binstitutional\b|\binstl\b", text):
         return "institutional"
     if re.search(r"\binvestor\s+a\d?\b", text) or re.search(r"(?:^|\bclass\s+)a\d?\b", text) or text in {"a", "a class", "a shares"}:
         return "A"
     if re.search(r"\binvestor\s+c\b", text) or re.search(r"(?:^|\bclass\s+)c\b", text) or text in {"c", "c class", "c shares"}:
         return "C"
+    if re.search(r"\br\s*6\b(?!\s*e\b)", text):
+        return "R6"
     if (
         re.search(r"\bretirement\b|\b401\s?k\b", text)
-        or re.search(r"\br\s*[1-6]\b", text)
+        or re.search(r"\br\s*[1-5]\b", text)
         or re.search(r"\bclass\s+r\b", text)
         or re.search(r"\bclass\s+k\b", text)
         or text in {"r", "r class", "r shares"}
@@ -237,14 +281,62 @@ def class_type(name: str) -> str:
         return "institutional"
     if re.search(r"\binvestor\b|\bretail\b|\bno\s*load\b", text):
         return "investor"
+    if series_name and text == normalize_class_name(series_name):
+        return "investor"
     return "other"
 
 
 def fund_type(series_name: str) -> str:
+    """Keyword types. Equity Income is not a bond; Gold is a sector, not international."""
+    text = series_name or ""
     for name, pattern in FUND_TYPE_RULES:
-        if pattern.search(series_name or ""):
+        if name == "bond" and NOT_BOND.search(text):
+            continue
+        if pattern.search(text):
             return name
     return "unmatched"
+
+
+def series_sponsor(series_name: str) -> str:
+    """First word of a multi-sponsor series, or two words when the second is part of the name."""
+    left = re.split(r"[/]", series_name or "", maxsplit=1)[0]
+    words = re.findall(r"[A-Za-z0-9]+", left)
+    if not words:
+        return (series_name or "").strip() or "Unknown"
+    if len(words) >= 2 and words[1].lower() in SPONSOR_SECOND_WORD:
+        return f"{words[0]} {words[1]}"
+    return words[0]
+
+
+def load_family_rules(path: Path | None) -> list[tuple[re.Pattern[str], str]]:
+    if path is None or not path.exists():
+        return []
+    rules = []
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        columns = _column_map(reader.fieldnames)
+        pattern_col = _col(columns, "pattern")
+        family_col = _col(columns, "family")
+        if not pattern_col or not family_col:
+            raise SystemExit(f"{path} must have pattern and family columns")
+        for row in reader:
+            pattern = (row.get(pattern_col) or "").strip()
+            family = (row.get(family_col) or "").strip()
+            if not pattern or not family:
+                continue
+            rules.append((re.compile(pattern, re.I), family))
+    return rules
+
+
+def assign_family(series_name: str, filer_name: str, rules: list[tuple[re.Pattern[str], str]]) -> tuple[str, str]:
+    """Return (family, source) where source is alias, sponsor, or filer."""
+    blob = f"{series_name}\n{filer_name}"
+    for pattern, family in rules:
+        if pattern.search(blob):
+            return family, "alias"
+    if MULTI_SPONSOR.search(filer_name or ""):
+        return series_sponsor(series_name), "sponsor"
+    return filer_name or series_name, "filer"
 
 
 def is_etf_series(series_name: str) -> bool:
@@ -307,12 +399,13 @@ def read_candidates(path: Path) -> list[Series]:
                 ticker=cell(row, "ticker"),
                 adsh=cell(row, "adsh"),
                 complete=_truthy(cell(row, "complete")),
-                class_type=class_type(cell(row, "classname")),
+                class_type=class_type(cell(row, "classname"), cell(row, "seriesname")),
             )
             series.classes.append(share)
     series_list = list(grouped.values())
     for series in series_list:
         series.fund_type = fund_type(series.series_name)
+        series.type_before = series.fund_type
     return series_list
 
 
@@ -414,8 +507,8 @@ def _is_minimum_tag(tag: str) -> bool:
     return MINIMUM_TAG.search(tag or "") is not None
 
 
-def read_rr_facts(zip_path: Path, wanted: set[tuple[str, str]]) -> dict:
-    """Sales loads, fee waivers, and minimum initial investments for selected classes."""
+def _read_rr_zip(zip_path: Path, wanted: set[tuple[str, str]]) -> dict:
+    """Sales loads, fee waivers, and minimum initial investments in one zip."""
     loaded: set[str] = set()
     waived: set[str] = set()
     minimums: dict[str, Decimal] = {}
@@ -457,6 +550,30 @@ def read_rr_facts(zip_path: Path, wanted: set[tuple[str, str]]) -> dict:
     }
 
 
+def read_rr_facts(zip_paths: Path | list[Path], wanted: set[tuple[str, str]]) -> dict:
+    """Union of sales-load and fee facts across every Risk/Return zip."""
+    paths = [zip_paths] if isinstance(zip_paths, Path) else list(zip_paths)
+    loaded: set[str] = set()
+    waived: set[str] = set()
+    minimums: dict[str, Decimal] = {}
+    minimum_tags: set[str] = set()
+    for path in paths:
+        part = _read_rr_zip(path, wanted)
+        loaded |= part["loaded"]
+        waived |= part["waived"]
+        minimum_tags.update(part["minimum_tags"])
+        for class_id, amount in part["minimums"].items():
+            current = minimums.get(class_id)
+            if current is None or amount < current:
+                minimums[class_id] = amount
+    return {
+        "loaded": loaded,
+        "waived": waived,
+        "minimums": minimums,
+        "minimum_tags": sorted(minimum_tags),
+    }
+
+
 def _choose_main(classes: list[ShareClass]) -> ShareClass | None:
     def ordered(pool: list[ShareClass]) -> ShareClass:
         return sorted(pool, key=lambda share: (share.ticker == "", share.class_id))[0]
@@ -470,7 +587,10 @@ def _choose_main(classes: list[ShareClass]) -> ShareClass | None:
         if share.complete and share.class_type == "investor" and share.no_load
     ]
     if investor:
-        return ordered(investor)
+        return sorted(
+            investor,
+            key=lambda share: ("admiral" not in share.class_name.lower(), share.ticker == "", share.class_id),
+        )[0]
     return None
 
 
@@ -517,15 +637,23 @@ def rank_series(series_list: list[Series]) -> list[Series]:
 def fill_quotas(
     ranked: list[Series],
     quotas: tuple[tuple[str, int], ...] = QUOTAS,
-    filer_cap: int = FILER_CAP,
+    family_cap: int = FAMILY_CAP,
+    filer_cap: int | None = None,
 ) -> list[Series]:
-    """Walk the ranking. Unfilled quota slots then go to the next-largest series of any type."""
+    """Walk the ranking. Unfilled quota slots go to the next-largest series of any included type.
+
+    Alternatives (quota 0) are never selected. filer_cap is the old name of family_cap.
+    """
+    cap = family_cap if filer_cap is None else filer_cap
     remaining = {name: count for name, count in quotas}
-    per_filer: Counter = Counter()
+    per_family: Counter = Counter()
     selected: list[Series] = []
     waiting: list[Series] = []
     for series in ranked:
-        if per_filer[series.filer_key] >= filer_cap:
+        if series.fund_type in EXCLUDED_TYPES:
+            continue
+        family = series.family or series.filer_name or series.series_id
+        if per_family[family] >= cap:
             continue
         left = remaining.get(series.fund_type)
         if left is None or left <= 0:
@@ -536,18 +664,19 @@ def fill_quotas(
         series.selected_by = "rule"
         selected.append(series)
         remaining[series.fund_type] -= 1
-        per_filer[series.filer_key] += 1
-    slots = sum(remaining.values())
+        per_family[family] += 1
+    slots = sum(count for name, count in remaining.items() if name not in EXCLUDED_TYPES)
     for series in waiting:
         if slots <= 0:
             break
-        if per_filer[series.filer_key] >= filer_cap:
+        family = series.family or series.filer_name or series.series_id
+        if per_family[family] >= cap:
             continue
         series.how = "leftover"
         series.reason = "leftover"
         series.selected_by = "rule"
         selected.append(series)
-        per_filer[series.filer_key] += 1
+        per_family[family] += 1
         slots -= 1
     return selected
 
@@ -600,13 +729,14 @@ def apply_overrides(
 
 
 def classes_to_load(series: Series) -> list[ShareClass]:
+    """Main class, plus complete F-2, F-3, C, R-6, and 529-A. Not F-1, R-1–R-5, or other 529s."""
     loaded = []
+    main_id = series.main.class_id if series.main else ""
     for share in series.classes:
-        if not share.complete or share.class_type not in LOADED_TYPES:
+        if not share.complete:
             continue
-        if share.class_type == "investor" and not share.no_load:
-            continue
-        loaded.append(share)
+        if share.class_id == main_id or share.class_type in LOAD_EXTRA:
+            loaded.append(share)
     return sorted(loaded, key=lambda share: share.class_id)
 
 
@@ -617,15 +747,89 @@ def attach_assets(series_list: list[Series], assets: dict[str, tuple[Decimal | N
         series.report_date = report_date
 
 
+def _read_type_overrides(path: Path | None) -> list[dict[str, str]]:
+    if path is None or not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        if not reader.fieldnames:
+            return []
+        columns = _column_map(reader.fieldnames)
+        series_col = _col(columns, "seriesid", "series_id")
+        type_col = _col(columns, "fundtype", "fund_type")
+        reason_col = _col(columns, "reason")
+        if not series_col or not type_col:
+            raise SystemExit(f"{path} must have series_id and fund_type columns")
+        rows = []
+        for row in reader:
+            series_id = (row.get(series_col) or "").strip().upper()
+            fund_type_name = (row.get(type_col) or "").strip()
+            if not series_id or not fund_type_name:
+                continue
+            rows.append(
+                {
+                    "series_id": series_id,
+                    "fund_type": fund_type_name,
+                    "reason": (row.get(reason_col) or "").strip() if reason_col else "",
+                }
+            )
+        return rows
+
+
+def apply_type_overrides(series_list: list[Series], rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Apply manual types before quotas. Returns the corrections that matched a series."""
+    by_id = {series.series_id: series for series in series_list}
+    applied = []
+    for row in rows:
+        series = by_id.get(row["series_id"])
+        if series is None:
+            applied.append({**row, "series_name": "", "previous": "", "applied": False})
+            continue
+        previous = series.fund_type
+        series.type_before = previous
+        series.fund_type = row["fund_type"]
+        series.type_reason = row["reason"]
+        applied.append(
+            {
+                **row,
+                "series_name": series.series_name,
+                "previous": previous,
+                "applied": previous != row["fund_type"],
+            }
+        )
+    return applied
+
+
+def apply_asset_floor(eligible: list[Series], floor: Decimal) -> tuple[list[Series], list[Series]]:
+    """Drop series under the floor and series with no N-PORT assets."""
+    kept = []
+    dropped = []
+    for series in eligible:
+        if series.net_assets is None or series.net_assets < floor:
+            dropped.append(series)
+        else:
+            kept.append(series)
+    return kept, dropped
+
+
 def build_selection(
     candidates: Path,
-    rr_zip: Path,
+    rr_zip: Path | list[Path],
     nport_zip: Path,
     overrides: Path | None = None,
     quotas: tuple[tuple[str, int], ...] = QUOTAS,
-    filer_cap: int = FILER_CAP,
+    family_cap: int = FAMILY_CAP,
+    filer_cap: int | None = None,
+    asset_floor: Decimal = ASSET_FLOOR,
+    families_path: Path | None = Path("eval/families.csv"),
+    type_overrides_path: Path | None = Path("eval/fund_type_overrides.csv"),
 ) -> dict:
     series_list = read_candidates(candidates)
+    rules = load_family_rules(families_path)
+    for series in series_list:
+        series.family, series.family_source = assign_family(series.series_name, series.filer_name, rules)
+    type_rows = _read_type_overrides(type_overrides_path)
+    type_corrections = apply_type_overrides(series_list, type_rows)
     wanted = {
         (share.adsh, share.class_id)
         for series in series_list
@@ -636,18 +840,20 @@ def build_selection(
     filtered = apply_hard_filters(series_list, facts)
     eligible = filtered["eligible"]
     attach_assets(eligible, read_net_assets(nport_zip))
+    eligible, too_small = apply_asset_floor(eligible, asset_floor)
     ranked = rank_series(eligible)
-    selected = fill_quotas(ranked, quotas=quotas, filer_cap=filer_cap)
+    selected = fill_quotas(ranked, quotas=quotas, family_cap=family_cap, filer_cap=filer_cap)
     override_rows: list[dict[str, str]] = []
     if overrides is not None:
         override_rows = _override_rows(overrides)
         selected = apply_overrides(selected, eligible, override_rows)
     final = rank_series(selected)
     loaded = {series.series_id: classes_to_load(series) for series in final}
+    rr_names = [rr_zip.name] if isinstance(rr_zip, Path) else [path.name for path in rr_zip]
     return {
         "series_in": series_list,
         "eligible": eligible,
-        "dropped": filtered["dropped"],
+        "dropped": {**filtered["dropped"], "small": too_small},
         "minimum_active": filtered["minimum_active"],
         "minimum_tags": facts["minimum_tags"],
         "ranked": ranked,
@@ -655,11 +861,17 @@ def build_selection(
         "loaded": loaded,
         "quotas": quotas,
         "overrides": override_rows,
+        "type_corrections": type_corrections,
+        "asset_floor": asset_floor,
+        "family_cap": family_cap if filer_cap is None else filer_cap,
         "inputs": {
             "candidates": candidates,
             "rr_zip": rr_zip,
+            "rr_names": rr_names,
             "nport_zip": nport_zip,
             "overrides": overrides,
+            "families": families_path,
+            "type_overrides": type_overrides_path,
         },
     }
 
@@ -684,7 +896,7 @@ def render_report(result: dict) -> str:
         "## Inputs",
         "",
         f"- Candidates: `{inputs['candidates'].name}`",
-        f"- Risk/Return zip: `{inputs['rr_zip'].name}`",
+        f"- Risk/Return zips: {', '.join(f'`{name}`' for name in inputs['rr_names'])}",
         f"- N-PORT zip: `{inputs['nport_zip'].name}`",
         f"- Overrides: `{inputs['overrides'].name}`" if inputs["overrides"] else "- Overrides: none",
         "",
@@ -706,12 +918,17 @@ def render_report(result: dict) -> str:
             "No minimum-initial-investment tag was in the Risk/Return zip "
             "(expense-breakpoint minimums are not that tag)."
         )
-    lines.append(f"- Eligible after hard filters: {len(result['eligible'])}")
+    lines.append(f"- Dropped, net assets under ${format_assets(result['asset_floor'])} or no N-PORT match: {len(dropped['small'])}")
+    lines.append(f"- Eligible after hard filters and the size floor: {len(result['eligible'])}")
     lines.append(f"- Selected: {len(selected)}")
+    below = [series for series in selected if series.net_assets is None or series.net_assets < result["asset_floor"]]
+    lines.append(
+        f"- No selected fund under ${format_assets(result['asset_floor'])}: {'met' if not below else 'not met'}"
+    )
     if len(selected) < 100:
         lines.append(
             f"- Fewer than 100 because {len(result['eligible'])} series passed the hard filters "
-            "and the quota, filer cap, and overrides left this many."
+            "and the size floor, and the quotas, family cap, and overrides left this many."
         )
     lines += ["", "## Quotas", "", "| Type | Quota | Filled by quota | Filled by leftover | Selected |", "| --- | --- | --- | --- | --- |"]
     for name, quota, by_quota, by_left in _quota_table(result):
@@ -720,10 +937,28 @@ def render_report(result: dict) -> str:
         count = sum(1 for series in selected if series.fund_type == "unmatched")
         lines.append(f"| unmatched | 0 | 0 | {count} | {count} |")
 
+    eligible_by_type: Counter = Counter(series.fund_type for series in result["eligible"])
+    index_quota = dict(result["quotas"]).get("index_equity", 0)
+    index_selected = sum(1 for series in selected if series.fund_type == "index_equity")
+    index_eligible = eligible_by_type["index_equity"]
+    lines += ["", "## Index equity", ""]
+    if index_selected >= index_quota:
+        lines.append(f"Index equity filled its quota ({index_selected} selected, quota {index_quota}).")
+    elif index_eligible < index_quota:
+        lines.append(
+            f"Index equity is not full: {index_selected} selected of quota {index_quota}. "
+            f"Only {index_eligible} index series passed the hard filters and the size floor."
+        )
+    else:
+        lines.append(
+            f"Index equity is not full: {index_selected} selected of quota {index_quota}, "
+            f"with {index_eligible} eligible. The family cap held the rest back."
+        )
+
     loaded_counts: Counter = Counter()
     multi = 0
     waiver = 0
-    filers: dict[str, list[Series]] = defaultdict(list)
+    families: dict[str, list[Series]] = defaultdict(list)
     for series in selected:
         shares = result["loaded"][series.series_id]
         if len(shares) >= 2:
@@ -732,7 +967,7 @@ def render_report(result: dict) -> str:
             waiver += 1
         for share in shares:
             loaded_counts[share.class_type] += 1
-        filers[series.filer_key].append(series)
+        families[series.family or series.filer_name].append(series)
 
     def mark(ok: bool) -> str:
         return "met" if ok else "not met"
@@ -743,7 +978,10 @@ def render_report(result: dict) -> str:
         "",
         "These checks are reported and do not change the selection.",
         "",
-        f"- Distinct filers: {len(filers)} (target at least 10, {mark(len(filers) >= 10)})",
+        f"- Distinct families: {len(families)} (target at least 10, {mark(len(families) >= 10)})",
+        f"- No family above {result['family_cap']} series: "
+        f"{mark(all(len(group) <= result['family_cap'] for group in families.values()))}",
+        f"- Loaded share classes: {sum(loaded_counts.values())}",
         f"- Series with 2 or more loaded classes: {multi} (target at least 50, {mark(multi >= 50)})",
         f"- Series whose main class has a nonzero fee waiver: {waiver} "
         f"(target at least 10, {mark(waiver >= 10)})",
@@ -751,13 +989,62 @@ def render_report(result: dict) -> str:
         "| Loaded class type | Count |",
         "| --- | --- |",
     ]
-    for name in ("A", "investor", "F2", "F3", "C", "retirement", "529"):
+    for name in ("A", "investor", "F1", "F2", "F3", "C", "R6", "529A"):
         lines.append(f"| {name} | {loaded_counts[name]} |")
+    lines.append("")
+    f3_shares = [share for series in selected for share in series.classes if share.class_type == "F3"]
+    f3_complete = sum(1 for share in f3_shares if share.complete)
+    if loaded_counts["F3"] == 0:
+        if not f3_shares:
+            f3_why = "No selected series has a class named F-3."
+        else:
+            f3_why = (
+                f"{len(f3_shares)} F-3 classes sit on selected series and {f3_complete} of them "
+                "are complete, so none is loaded. They stay classified as F-3. Coverage shows the "
+                "incomplete ones are missing a flag, almost always the 1/5/10-year return."
+            )
+    else:
+        f3_why = f"{loaded_counts['F3']} complete F-3 classes were loaded."
+    lines.append(
+        "F-1 is its own class type and is not loaded. R-6 is the only retirement class loaded, "
+        "and 529-A is the only 529 class loaded. " + f3_why
+    )
 
-    lines += ["", "## Filers", "", "| Filer | CIK | Series |", "| --- | --- | --- |"]
-    filer_rows = sorted(filers.values(), key=lambda group: (-len(group), group[0].filer_name))
-    for group in filer_rows:
-        lines.append(f"| {group[0].filer_name} | {group[0].cik} | {len(group)} |")
+    lines += ["", "## Families", "", "| Family | Series |", "| --- | --- |"]
+    family_rows = sorted(families.values(), key=lambda group: (-len(group), group[0].family))
+    for group in family_rows:
+        lines.append(f"| {group[0].family} | {len(group)} |")
+
+    fallbacks = [
+        series
+        for series in result["eligible"]
+        if series.family_source == "filer"
+    ]
+    lines += ["", "## Family fallbacks", ""]
+    if not fallbacks:
+        lines.append("No eligible series fell back to its filer name.")
+    else:
+        lines.append(
+            f"{len(fallbacks)} eligible series did not match a family alias or a multi-sponsor trust. "
+            "Their family is the filer name."
+        )
+        lines.append("")
+        for series in sorted(fallbacks, key=lambda item: (item.family, item.series_name)):
+            lines.append(f"- {series.series_name} ({series.filer_name}) → {series.family}")
+
+    corrections = result.get("type_corrections") or []
+    lines += ["", "## Fund-type corrections", ""]
+    if not corrections:
+        lines.append("No rows in the fund-type override file.")
+    else:
+        for row in corrections:
+            if not row.get("series_name"):
+                lines.append(f"- `{row['series_id']}` was not in the candidates ({row['reason']})")
+                continue
+            lines.append(
+                f"- {row['series_name']} (`{row['series_id']}`): {row['previous']} → {row['fund_type']}"
+                + (f" — {row['reason']}" if row["reason"] else "")
+            )
 
     unmatched = sorted(
         {series.series_name for series in result["eligible"] if series.fund_type == "unmatched"}
@@ -790,6 +1077,7 @@ def write_outputs(result: dict, universe_path: Path, classes_path: Path, report_
                     "series_name": series.series_name,
                     "filer_name": series.filer_name,
                     "cik": series.cik,
+                    "family": series.family,
                     "fund_type": series.fund_type,
                     "main_class_id": main.class_id if main else "",
                     "main_class_type": main.class_type if main else "",
@@ -820,9 +1108,12 @@ def write_outputs(result: dict, universe_path: Path, classes_path: Path, report_
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidates", required=True, type=Path)
-    parser.add_argument("--rr-zip", required=True, type=Path)
+    parser.add_argument("--rr-zip", required=True, action="append", type=Path, dest="rr_zips")
     parser.add_argument("--nport-zip", required=True, type=Path)
     parser.add_argument("--overrides", type=Path)
+    parser.add_argument("--families", type=Path, default=Path("eval/families.csv"))
+    parser.add_argument("--type-overrides", type=Path, default=Path("eval/fund_type_overrides.csv"))
+    parser.add_argument("--asset-floor", type=Decimal, default=ASSET_FLOOR)
     parser.add_argument("--universe", type=Path, default=Path("eval/fund_universe.csv"))
     parser.add_argument("--classes", type=Path, default=Path("eval/share_classes.csv"))
     parser.add_argument("--report", type=Path, default=Path("reports/selection.md"))
@@ -830,8 +1121,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.overrides is not None and not args.overrides.exists():
         raise SystemExit(f"overrides file not found: {args.overrides}")
 
-    result = build_selection(args.candidates, args.rr_zip, args.nport_zip, args.overrides)
+    result = build_selection(
+        args.candidates,
+        args.rr_zips,
+        args.nport_zip,
+        args.overrides,
+        families_path=args.families,
+        type_overrides_path=args.type_overrides,
+        asset_floor=args.asset_floor,
+    )
     write_outputs(result, args.universe, args.classes, args.report)
+    fallbacks = [series for series in result["eligible"] if series.family_source == "filer"]
+    if fallbacks:
+        print(f"Family fell back to the filer name for {len(fallbacks)} eligible series:")
+        for series in sorted(fallbacks, key=lambda item: (item.family, item.series_name)):
+            print(f"  {series.series_name} ({series.filer_name})")
     print(f"Selected {len(result['selected'])} series")
     print(f"Wrote {args.universe}, {args.classes}, and {args.report}")
     return 0

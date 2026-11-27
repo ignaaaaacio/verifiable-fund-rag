@@ -1,0 +1,5 @@
+series_id,fund_type,reason
+S000009707,bond,PIMCO Total Return is a bond fund; the name has no bond keyword so it matched Fund
+S000009618,international,EUPAC is the EuroPacific Growth Fund; the legal name does not say international
+S000009613,international,New Perspective is American Funds' global stock fund; the legal name does not say global
+S000008814,target_date_balanced,Income Fund of America is an allocation fund; Income would otherwise mark it a bond

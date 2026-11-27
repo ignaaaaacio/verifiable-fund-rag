@@ -1,0 +1,39 @@
+pattern,family
+JPMorgan|J\.P\. Morgan|JP Morgan|Undiscovered Managers,JPMorgan
+Growth Fund of America|Bond Fund of America|American Funds|of America|Capital Research|Capital Group|AMCAP|American Balanced|American Mutual|American High-Income|Capital Income Builder|Capital World|EUPAC|EuroPacific|New Economy Fund|New Perspective Fund|New World Fund|SmallCap World|Washington Mutual Investors|Investment Company of America|Fundamental Investors|International Growth (?:&|and) Income,American Funds
+\bAB\b|AllianceBernstein,AB
+Fidelity,Fidelity
+Vanguard,Vanguard
+T\. Rowe Price|T Rowe Price,T. Rowe Price
+Dodge\s*(&|and)\s*Cox,Dodge & Cox
+PIMCO,PIMCO
+BlackRock,BlackRock
+Invesco,Invesco
+Franklin Templeton|\bFranklin\b,Franklin Templeton
+PGIM|Prudential,PGIM
+\bMFS\b,MFS
+Nuveen,Nuveen
+John Hancock,John Hancock
+Goldman Sachs,Goldman Sachs
+Morgan Stanley,Morgan Stanley
+Eaton Vance,Eaton Vance
+Lord Abbett,Lord Abbett
+Columbia,Columbia
+Hartford,Hartford
+\bPrincipal\b,Principal
+TIAA,TIAA
+Schwab,Schwab
+Dimensional|\bDFA\b,Dimensional
+Janus,Janus Henderson
+Virtus,Virtus
+Victory,Victory
+American Century,American Century
+Federated,Federated Hermes
+Putnam,Putnam
+BNY Mellon|Dreyfus,BNY Mellon
+First Eagle,First Eagle
+Oakmark,Oakmark
+\bBaron\b,Baron
+Artisan,Artisan
+\bGMO\b,GMO
+\bAQR\b,AQR
